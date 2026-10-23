@@ -1,0 +1,446 @@
+From 7180ea3669717589b43752ecb0229ff8bfcd6176 Mon Sep 17 00:00:00 2001
+From: Lutfil Hadi <lutfilhadi1999@gmail.com>
+Date: Fri, 23 Oct 2026 21:03:05 +0800
+Subject: [PATCH] wifi: mt76: mt7615: add experimental explicit TX beamforming
+
+mt7615 has never advertised or enabled VHT TX beamforming, although the
+hardware and firmware support it (MediaTek's vendor mt7615 driver ships
+with eBF on). Add SU explicit beamformer support behind a new txbf
+module parameter, off by default.
+
+The firmware interface follows the vendor mt7615d driver:
+- init: TXBF_ACTION sounding on in BF_PROCESSING mode, then
+  BF_HW_ENABLE_STATUS_UPDATE with eBF enabled
+- per station: the 36 byte MT7615 STA_REC_BF layout (shorter than the
+  connac one) with PFMU 0xffff so firmware allocates the profile, the
+  WTBL_BF ebf_vht bit and BF_DATA_PACKET_APPLY
+- per station SU periodic sounding (txbf_snd_ms, default 100ms). The
+  vendor driver relies on firmware rate control to trigger sounding,
+  but mt76 does rate control on the host, so without this the firmware
+  never sounds and no frame is beamformed.
+
+The beamformer capability is reapplied once the EEPROM chainmask is
+known, since mt7615_init_device() runs before mt7615_eeprom_init().
+
+Add debugfs counters txbf_txs_{all,ebf,ibf} from the TX status E/I_TXBF
+bits to verify it on air.
+
+Tested on Xiaomi Redmi AC2100 (MT7621 + MT7615N 4x4) with ImmortalWrt
+25.12.2 and N9 firmware 20200814: 97% of TX status reports to a VHT
+SU beamformee carried E_TXBF (126730 of 130396), with TX retries going
+from 9% to 4%.
+
+Signed-off-by: Lutfil Hadi <lutfilhadi1999@gmail.com>
+---
+ mt7615/debugfs.c |   3 +
+ mt7615/eeprom.c  |   2 +
+ mt7615/init.c    |  23 ++++++
+ mt7615/mac.c     |   3 +
+ mt7615/main.c    |   2 +
+ mt7615/mcu.c     | 204 ++++++++++++++++++++++++++++++++++++++++++++++-
+ mt7615/mcu.h     |  10 +++
+ mt7615/mt7615.h  |   6 ++
+ 8 files changed, 251 insertions(+), 2 deletions(-)
+
+diff --git a/mt7615/debugfs.c b/mt7615/debugfs.c
+index 0f7b2015..de9ce0d9 100644
+--- a/mt7615/debugfs.c
++++ b/mt7615/debugfs.c
+@@ -562,6 +562,9 @@ int mt7615_init_debugfs(struct mt7615_dev *dev)
+ 	debugfs_create_devm_seqfile(dev->mt76.dev, "acq", dir,
+ 				    mt7615_queues_acq);
+ 	debugfs_create_file("ampdu_stat", 0400, dir, dev, &mt7615_ampdu_stat_fops);
++	debugfs_create_u32("txbf_txs_all", 0400, dir, &dev->txbf_stat[0]);
++	debugfs_create_u32("txbf_txs_ebf", 0400, dir, &dev->txbf_stat[1]);
++	debugfs_create_u32("txbf_txs_ibf", 0400, dir, &dev->txbf_stat[2]);
+ 	debugfs_create_file("scs", 0600, dir, dev, &fops_scs);
+ 	debugfs_create_file("dbdc", 0600, dir, dev, &fops_dbdc);
+ 	debugfs_create_file("fw_debug", 0600, dir, dev, &fops_fw_debug);
+diff --git a/mt7615/eeprom.c b/mt7615/eeprom.c
+index d6828e1c..a78b186e 100644
+--- a/mt7615/eeprom.c
++++ b/mt7615/eeprom.c
+@@ -168,6 +168,8 @@ static void mt7615_eeprom_parse_hw_cap(struct mt7615_dev *dev)
+ 	dev->chainmask = BIT(tx_mask) - 1;
+ 	dev->mphy.antenna_mask = dev->chainmask;
+ 	dev->mphy.chainmask = dev->chainmask;
++	/* init_device set caps before chainmask was known */
++	mt7615_cap_txbf(dev);
+ }
+ 
+ static int mt7663_eeprom_get_target_power_index(struct mt7615_dev *dev,
+diff --git a/mt7615/init.c b/mt7615/init.c
+index e437e088..72ee906e 100644
+--- a/mt7615/init.c
++++ b/mt7615/init.c
+@@ -321,6 +321,9 @@ void mt7615_init_work(struct mt7615_dev *dev)
+ 	mt7615_mcu_set_eeprom(dev);
+ 	mt7615_mac_init(dev);
+ 	mt7615_phy_init(dev);
++	if (mt7615_txbf && is_mt7615(&dev->mt76) &&
++	    mt7615_mcu_set_txbf(dev))
++		dev_warn(dev->mt76.dev, "txbf: enabling eBF failed\n");
+ 	mt76_connac_mcu_del_wtbl_all(&dev->mt76);
+ 	mt7615_check_offload_capability(dev);
+ }
+@@ -416,6 +419,24 @@ mt7615_init_wiphy(struct ieee80211_hw *hw)
+ 			IEEE80211_VHT_CAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK;
+ }
+ 
++void mt7615_cap_txbf(struct mt7615_dev *dev)
++{
++	u32 *cap = &dev->mphy.sband_5g.sband.vht_cap.cap;
++	int sts = hweight8(dev->mphy.chainmask);
++
++	*cap &= ~(IEEE80211_VHT_CAP_SU_BEAMFORMER_CAPABLE |
++		  IEEE80211_VHT_CAP_SOUNDING_DIMENSIONS_MASK);
++
++	/* SU beamformer only: beamformee would also need
++	 * MT_WF_RFCR1_DROP_BF_POLL cleared in the rx filter
++	 */
++	if (!mt7615_txbf || !is_mt7615(&dev->mt76) || sts < 2)
++		return;
++
++	*cap |= IEEE80211_VHT_CAP_SU_BEAMFORMER_CAPABLE |
++		FIELD_PREP(IEEE80211_VHT_CAP_SOUNDING_DIMENSIONS_MASK, sts - 1);
++}
++
+ static void
+ mt7615_cap_dbdc_enable(struct mt7615_dev *dev)
+ {
+@@ -430,6 +451,7 @@ mt7615_cap_dbdc_enable(struct mt7615_dev *dev)
+ 	dev->mphy.hw->wiphy->available_antennas_rx = dev->mphy.chainmask;
+ 	dev->mphy.hw->wiphy->available_antennas_tx = dev->mphy.chainmask;
+ 	mt76_set_stream_caps(&dev->mphy, true);
++	mt7615_cap_txbf(dev);
+ }
+ 
+ static void
+@@ -443,6 +465,7 @@ mt7615_cap_dbdc_disable(struct mt7615_dev *dev)
+ 	dev->mphy.hw->wiphy->available_antennas_rx = dev->chainmask;
+ 	dev->mphy.hw->wiphy->available_antennas_tx = dev->chainmask;
+ 	mt76_set_stream_caps(&dev->mphy, true);
++	mt7615_cap_txbf(dev);
+ }
+ 
+ u32 mt7615_reg_map(struct mt7615_dev *dev, u32 addr)
+diff --git a/mt7615/mac.c b/mt7615/mac.c
+index d3478390..8b43fc88 100644
+--- a/mt7615/mac.c
++++ b/mt7615/mac.c
+@@ -1306,6 +1306,9 @@ static bool mt7615_fill_txs(struct mt7615_dev *dev, struct mt7615_sta *sta,
+ 
+ 	txs = le32_to_cpu(txs_data[1]);
+ 	ampdu = txs & MT_TXS1_AMPDU;
++	dev->txbf_stat[0]++;
++	dev->txbf_stat[1] += !!(txs & MT_TXS1_E_TXBF);
++	dev->txbf_stat[2] += !!(txs & MT_TXS1_I_TXBF);
+ 
+ 	txs = le32_to_cpu(txs_data[3]);
+ 	count = FIELD_GET(MT_TXS3_TX_COUNT, txs);
+diff --git a/mt7615/main.c b/mt7615/main.c
+index fc619acb..742a044e 100644
+--- a/mt7615/main.c
++++ b/mt7615/main.c
+@@ -1013,6 +1013,8 @@ mt7615_set_antenna(struct ieee80211_hw *hw, int radio_idx,
+ 	phy->mt76->chainmask = tx_ant;
+ 
+ 	mt76_set_stream_caps(phy->mt76, true);
++	if (!ext_phy)
++		mt7615_cap_txbf(dev);
+ 
+ 	mt7615_mutex_release(dev);
+ 
+diff --git a/mt7615/mcu.c b/mt7615/mcu.c
+index ff57ede8..86406e0e 100644
+--- a/mt7615/mcu.c
++++ b/mt7615/mcu.c
+@@ -16,6 +16,14 @@ module_param(prefer_offload_fw, bool, 0644);
+ MODULE_PARM_DESC(prefer_offload_fw,
+ 		 "Prefer client mode offload firmware (MT7663)");
+ 
++bool mt7615_txbf;
++module_param_named(txbf, mt7615_txbf, bool, 0444);
++MODULE_PARM_DESC(txbf, "Experimental explicit VHT TX beamforming (MT7615)");
++
++static uint txbf_snd_ms = 100;
++module_param(txbf_snd_ms, uint, 0644);
++MODULE_PARM_DESC(txbf_snd_ms, "Per-station sounding interval in ms (0: firmware decides)");
++
+ struct mt7615_patch_hdr {
+ 	char build_date[16];
+ 	char platform[4];
+@@ -836,6 +844,178 @@ mt7615_mcu_wtbl_rx_ba(struct mt7615_dev *dev,
+ 				     MCU_EXT_CMD(WTBL_UPDATE), true);
+ }
+ 
++/* MT7615 firmware STA_REC_BF, vendor CMD_STAREC_BF (shorter than connac) */
++struct mt7615_sta_rec_bf {
++	__le16 tag;
++	__le16 len;
++
++	__le16 pfmu;		/* 0xffff: firmware allocates PFMU */
++	bool su_mu;
++	u8 bf_cap;		/* 0: iBF, 1: eBF */
++	u8 sounding_phy;
++	u8 ndpa_rate;
++	u8 ndp_rate;
++	u8 rept_poll_rate;
++	u8 tx_mode;
++	u8 ncol;
++	u8 nrow;
++	u8 bw;
++	u8 mem_total;
++	u8 mem_20m;
++	u8 mem[8];
++	__le16 smart_ant;
++	u8 se_idx;
++	u8 auto_sounding;
++	u8 ibf_timeout;
++	u8 ibf_dbw;
++	u8 ibf_ncol;
++	u8 ibf_nrow;
++	u8 rsv[2];
++} __packed;
++
++static bool
++mt7615_sta_txbf(struct mt7615_phy *phy, struct ieee80211_sta *sta)
++{
++	struct ieee80211_sta_vht_cap *pc = &sta->deflink.vht_cap;
++	u32 vc = phy->mt76->sband_5g.sband.vht_cap.cap;
++
++	return mt7615_txbf && is_mt7615(phy->mt76->dev) &&
++	       hweight8(phy->mt76->chainmask) > 1 && pc->vht_supported &&
++	       (pc->cap & IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE) &&
++	       (vc & IEEE80211_VHT_CAP_SU_BEAMFORMER_CAPABLE);
++}
++
++/* vendor fw_cmd.c WTBL_BF: per-station "send VHT data with eBF" bit */
++static void
++mt7615_mcu_wtbl_bf_tlv(struct sk_buff *skb, void *wtbl_tlv)
++{
++	struct wtbl_bf *bf;
++
++	bf = (struct wtbl_bf *)mt76_connac_mcu_add_nested_tlv(skb, WTBL_BF,
++							      sizeof(*bf),
++							      wtbl_tlv, NULL);
++	bf->ebf_vht = 1;
++}
++
++/* mirrors vendor mt_AsicBfStaRecUpdate() for VHT eBF */
++static void
++mt7615_mcu_sta_bf_tlv(struct mt7615_phy *phy, struct sk_buff *skb,
++		      struct ieee80211_sta *sta)
++{
++	static const u8 mem_20m[4][4] = {
++		{ 0, 0, 0, 0 }, { 1, 1, 0, 0 }, { 2, 4, 4, 0 }, { 3, 5, 6, 0 },
++	};
++	static const u8 mem_bw[4] = { 0, 1, 2, 2 };
++	struct ieee80211_sta_vht_cap *pc = &sta->deflink.vht_cap;
++	u32 vc = phy->mt76->sband_5g.sband.vht_cap.cap;
++	u16 mcs_map = le16_to_cpu(pc->vht_mcs.rx_mcs_map);
++	u8 tx_ant = hweight8(phy->mt76->chainmask) - 1;
++	struct mt7615_sta_rec_bf *bf;
++	u8 nss = 0, bw;
++	int i;
++
++	BUILD_BUG_ON(sizeof(*bf) != 36);
++
++	if (!mt7615_sta_txbf(phy, sta))
++		return;
++
++	for (i = 1; i < 4; i++)
++		if (((mcs_map >> (2 * i)) & 3) != IEEE80211_VHT_MCS_NOT_SUPPORTED)
++			nss = i;
++
++	bw = min_t(u8, sta->deflink.bandwidth, IEEE80211_STA_RX_BW_160);
++
++	bf = (struct mt7615_sta_rec_bf *)
++	     mt76_connac_mcu_add_tlv(skb, STA_REC_BF, sizeof(*bf));
++	bf->pfmu = cpu_to_le16(0xffff);
++	bf->bf_cap = 1;
++	bf->sounding_phy = 1;	/* OFDM */
++	bf->ndpa_rate = 9;	/* OFDM 24M */
++	bf->ndp_rate = 0;	/* MCS0 */
++	bf->rept_poll_rate = 9;	/* OFDM 24M */
++	bf->tx_mode = 4;	/* VHT */
++	bf->nrow = min3(FIELD_GET(IEEE80211_VHT_CAP_SOUNDING_DIMENSIONS_MASK, vc),
++			FIELD_GET(IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK, pc->cap),
++			(u32)tx_ant);
++	bf->ncol = min(nss, bf->nrow);
++	bf->bw = bw;
++	bf->mem_20m = mem_20m[tx_ant][bf->ncol];
++	bf->mem_total = bf->mem_20m * mem_bw[bw];
++	bf->ibf_timeout = 0x18;
++	bf->ibf_dbw = bw;
++	bf->ibf_ncol = bf->ncol;
++	bf->ibf_nrow = tx_ant;
++}
++
++static int mt7615_mcu_txbf_apply(struct mt7615_dev *dev, u8 wlan_idx)
++{
++	struct {
++		u8 action;
++		u8 wlan_idx;
++		bool ebf;
++		bool ibf;
++		bool mu;
++		bool phase_cal;
++		u8 rsv[2];
++	} __packed req = {
++		.action = MT_BF_DATA_PACKET_APPLY,
++		.wlan_idx = wlan_idx,
++		.ebf = true,
++	};
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(TXBF_ACTION), &req,
++				 sizeof(req), true);
++}
++
++/* vendor CmdETxBfSoundingPeriodicTriggerCtrl() */
++static int
++mt7615_mcu_txbf_sounding(struct mt7615_dev *dev, u8 mode, int wlan_idx,
++			 u32 period)
++{
++	struct {
++		u8 action;
++		u8 snd_mode;
++		u8 sta_num;
++		u8 rsv;
++		u8 wlan_idx[4];
++		__le32 snd_period;	/* ms */
++	} __packed req = {
++		.action = MT_BF_SOUNDING_ON,
++		.snd_mode = mode,
++		.snd_period = cpu_to_le32(period),
++	};
++
++	if (wlan_idx >= 0) {
++		req.sta_num = 1;
++		req.wlan_idx[0] = wlan_idx;
++	}
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(TXBF_ACTION), &req,
++				 sizeof(req), true);
++}
++
++/* vendor init: sounding in BF_PROCESSING mode, then report eBF hw enabled */
++int mt7615_mcu_set_txbf(struct mt7615_dev *dev)
++{
++	struct {
++		u8 action;
++		bool ebf;
++		bool ibf;
++		u8 rsv;
++	} __packed en = {
++		.action = MT_BF_HW_ENABLE_STATUS_UPDATE,
++		.ebf = true,
++	};
++	int ret;
++
++	ret = mt7615_mcu_txbf_sounding(dev, MT_BF_PROCESSING, -1, 0);
++	if (ret)
++		return ret;
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(TXBF_ACTION), &en,
++				 sizeof(en), true);
++}
++
+ static int
+ mt7615_mcu_wtbl_sta_add(struct mt7615_phy *phy, struct ieee80211_vif *vif,
+ 			struct ieee80211_sta *sta, bool enable)
+@@ -867,9 +1047,11 @@ mt7615_mcu_wtbl_sta_add(struct mt7615_phy *phy, struct ieee80211_vif *vif,
+ 	conn_state = enable ? CONN_STATE_PORT_SECURE : CONN_STATE_DISCONNECT;
+ 	mt76_connac_mcu_sta_basic_tlv(&dev->mt76, sskb, &vif->bss_conf,
+ 				      link_sta, conn_state, new_entry);
+-	if (enable && sta)
++	if (enable && sta) {
+ 		mt76_connac_mcu_sta_tlv(phy->mt76, sskb, sta, vif, 0,
+ 					MT76_STA_INFO_STATE_ASSOC);
++		mt7615_mcu_sta_bf_tlv(phy, sskb, sta);
++	}
+ 
+ 	wtbl_hdr = mt76_connac_mcu_alloc_wtbl_req(&dev->mt76, &msta->wcid,
+ 						  WTBL_RESET_AND_SET, NULL,
+@@ -887,6 +1069,8 @@ mt7615_mcu_wtbl_sta_add(struct mt7615_phy *phy, struct ieee80211_vif *vif,
+ 						    NULL, wtbl_hdr, true, true);
+ 		mt76_connac_mcu_wtbl_hdr_trans_tlv(wskb, vif, &msta->wcid,
+ 						   NULL, wtbl_hdr);
++		if (sta && mt7615_sta_txbf(phy, sta))
++			mt7615_mcu_wtbl_bf_tlv(wskb, wtbl_hdr);
+ 	}
+ 
+ 	cmd = enable ? MCU_EXT_CMD(WTBL_UPDATE) : MCU_EXT_CMD(STA_REC_UPDATE);
+@@ -903,7 +1087,23 @@ mt7615_mcu_wtbl_sta_add(struct mt7615_phy *phy, struct ieee80211_vif *vif,
+ 	cmd = enable ? MCU_EXT_CMD(STA_REC_UPDATE) : MCU_EXT_CMD(WTBL_UPDATE);
+ 	skb = enable ? sskb : wskb;
+ 
+-	return mt76_mcu_skb_send_msg(&dev->mt76, skb, cmd, true);
++	err = mt76_mcu_skb_send_msg(&dev->mt76, skb, cmd, true);
++	if (err < 0 || !enable || !sta || !mt7615_sta_txbf(phy, sta))
++		return err;
++
++	/* vendor CmdTxBfTxApplyCtrl(): "Set WTBL IBF EBF" */
++	err = mt7615_mcu_txbf_apply(dev, msta->wcid.idx);
++	if (err)
++		dev_warn(dev->mt76.dev, "txbf: apply failed: %d\n", err);
++
++	/* fw RA normally triggers sounding; mt76 runs RA on the host */
++	if (txbf_snd_ms)
++		err = mt7615_mcu_txbf_sounding(dev, MT_BF_SU_PERIODIC_SOUNDING,
++					       msta->wcid.idx, txbf_snd_ms);
++	if (err)
++		dev_warn(dev->mt76.dev, "txbf: sounding failed: %d\n", err);
++
++	return 0;
+ }
+ 
+ static int
+diff --git a/mt7615/mcu.h b/mt7615/mcu.h
+index 851b0e48..bc05c313 100644
+--- a/mt7615/mcu.h
++++ b/mt7615/mcu.h
+@@ -228,6 +228,16 @@ enum {
+ 	FW_STATE_N9_RDY = 2,
+ };
+ 
++/* vendor BF_ACTION_CATEGORY / BF_SOUNDING_MODE */
++enum {
++	MT_BF_SOUNDING_ON = 1,
++	MT_BF_DATA_PACKET_APPLY = 2,
++	MT_BF_HW_ENABLE_STATUS_UPDATE = 20,
++};
++
++#define MT_BF_SU_PERIODIC_SOUNDING	2
++#define MT_BF_PROCESSING	4
++
+ enum {
+ 	DBDC_TYPE_WMM,
+ 	DBDC_TYPE_MGMT,
+diff --git a/mt7615/mt7615.h b/mt7615/mt7615.h
+index fac05d1b..5e7358e3 100644
+--- a/mt7615/mt7615.h
++++ b/mt7615/mt7615.h
+@@ -283,6 +283,9 @@ struct mt7615_dev {
+ 
+ 	u32 muar_mask;
+ 
++	/* tx status counters: all, explicit BF, implicit BF */
++	u32 txbf_stat[3];
++
+ 	struct mt76_connac_pm pm;
+ 	struct mt76_connac_coredump coredump;
+ };
+@@ -487,6 +490,9 @@ u32 mt7615_rf_rr(struct mt7615_dev *dev, u32 wf, u32 reg);
+ int mt7615_rf_wr(struct mt7615_dev *dev, u32 wf, u32 reg, u32 val);
+ int mt7615_mcu_set_dbdc(struct mt7615_dev *dev);
+ int mt7615_mcu_set_eeprom(struct mt7615_dev *dev);
++int mt7615_mcu_set_txbf(struct mt7615_dev *dev);
++void mt7615_cap_txbf(struct mt7615_dev *dev);
++extern bool mt7615_txbf;
+ int mt7615_mcu_get_temperature(struct mt7615_dev *dev);
+ int mt7615_mcu_set_tx_power(struct mt7615_phy *phy);
+ void mt7615_mcu_exit(struct mt7615_dev *dev);
+-- 
+2.56.0
+
